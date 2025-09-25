@@ -1,0 +1,795 @@
+---
+title: "TravelPlus_assgt — Leila"
+author: "Leila Jahangiri"
+date: "`r format(Sys.Date())`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+#Setup 
+```{r Setup_Leila}
+set.seed(123)
+
+library(tidyverse)
+library(rsample)     # for splitting
+library(pROC)        # for ROC AUC performance
+library(yardstick)
+```
+
+
+#Read data
+```{r Read Data}
+df <- read_csv("../data/dataTravelPlus.csv")
+
+# Set the target variable as factor
+df <- df %>% mutate(Purchase = factor(Purchase))
+#Or, to get descriptiove 'No', 'Yes' labels:
+df <- df %>% mutate(purchase = factor(Purchase, levels = c(0,1), labels = c("No","Yes")))
+
+```
+## Q1(a) Overall purchase rate
+```{r Q1a}
+# Recode Purchase so it shows "No" and "Yes"
+df <- df %>%
+  mutate(Purchase = factor(Purchase, levels = c(0,1), labels = c("No","Yes")))
+
+# Counts of No vs Yes
+tab_purchase <- table(df$Purchase)
+
+# Neat table with counts + percents
+library(scales)
+rate_tbl <- tibble::tibble(
+  Purchase = names(tab_purchase),
+  Count    = as.integer(tab_purchase),
+  Percent  = percent(as.numeric(tab_purchase)/sum(tab_purchase), accuracy = 0.1)
+)
+
+knitr::kable(rate_tbl, caption = "Q1(a) Overall purchase rate")
+
+# Summary sentence
+overall_rate <- as.numeric(tab_purchase["Yes"])/sum(tab_purchase)
+cat(sprintf("Overall purchase rate: %s (Yes out of all customers).",
+            scales::percent(overall_rate, accuracy = 0.1)))
+```
+
+##From the results above, we see that **only 8% of customers purchased RoadsidePlus** (1,595 out of 20,000), while **92% did not purchase**.This shows the dataset is **highly imbalanced**, which is an important factor to consider for predictive modeling.
+
+
+#Some data exploration
+```{r Data Exploration}
+
+# get a list of names for the numeroc and categorical variables -- this can help analyze these as groups
+num_vars <- df %>% select(where(is.numeric)) %>% names()  
+cat_vars <- df %>% select(where(is.character)) %>% names()
+```
+
+```{r Q1(b)_numeric_summary_stats}
+#Summary stats(mean, min, max) by Purchase across all numeric variables
+num_summary<- df %>% group_by(Purchase) %>% summarise(across(all_of(num_vars),list(
+        mean = mean, min  = min, max  = max), .names = "{.col}_{.fn}") )
+
+
+#Boxplot
+df %>% ggplot(aes(x=Purchase, y=Score_Upsell, fill = Purchase)) + geom_boxplot()
+
+#Boxplots for multiple numeric variables
+vars_to_plot <- c("Score_Upsell","EmailOpens","EmailClicks","Score_Engagement","PriorAddons")
+for (v in vars_to_plot) {
+     p <- ggplot(df, aes(x = Purchase, y = .data[[v]], fill = Purchase)) +
+         geom_boxplot() +
+         labs(title = paste("Boxplot:", v, "by Purchase"), x = "Purchase", y = v) +
+         theme_minimal() + theme(legend.position = "none")
+     print(p)
+}
+
+#To get the different boxplots into a single figure:
+#first convert the data to 'long' form, with variable stacked top-to-bottom, and having two columns
+df_long <- df %>% pivot_longer(all_of(vars_to_plot), names_to = "variable", values_to = "value")
+#Then plot using facet_wrap to make one panel per variable
+ggplot(df_long, aes(x = Purchase, y = value, fill = Purchase)) +
+  geom_boxplot() +
+  facet_wrap(~ variable, scales = "free_y") + 
+          #allows each facet to have its own y-axis range (useful if variables are on different scales)
+  labs(title = "Boxplots by Purchase", x = "Purchase", y = NULL) +
+  theme_minimal() + theme(legend.position = "none")
+knitr::kable(num_summary, caption = "Q1(b) Numeric: summary stats by Purchase")
+```
+##From the boxplots we can see that purchasers generally have **higher EmailClicks and EmailOpens** than non-purchasers.  Similarly, **PriorAddons, Score_Engagement, and Score_Upsell** are higher on average among purchasers.  This suggests that these numeric variables are predictive signals.  At the same time, the overlap across groups shows that some predictors may include noise.
+
+
+#Analyses for categorical variables
+#For a categorical variable, say PetOwnership
+tab <- table(df$PetOwnership, df$Purchase)
+prop.table(tab, margin = 2) #get the proportions
+chisq.test(tab) #get results from a chi-sq test - what do you conclude?
+
+#Do this across multiple categorical variables
+# - we first define a function to do this for one variable, and then map the function across multiple categorical variables
+cat_chi <- function(var) {
+    tab <- table(df[[var]], df$Purchase)
+    test <- suppressWarnings(chisq.test(tab))
+    rates <- prop.table(tab, 1)[, "1"] #proportions of different levels of var for Purchase ='1' 
+    list(var = var, p_value = test$p.value, rates = rates, table = tab)
+}
+#Next, apply this function to the list of categorical variables
+cat_results <- lapply (cat_vars, cat_chi)
+
+#Can add names to the results
+names(cat_results) <- cat_vars
+#View results by variable as
+cat_results$PetOwnership  #or cat_results["PetOwnership"]
+
+# Print compact summaries
+for (res in cat_results) {
+  cat(sprintf("Variable: %s | Chi-square p = %.3g\n", res$var, res$p_value))
+  print(round(res$rates, 4))
+  cat("\n")
+}
+
+
+#Some plots -- stacked proportions for categorical variables
+df %>% ggplot( aes(x = LatePayments, fill = Purchase)) + geom_bar(position = "fill")
+
+# stacked proportion plot for a few categorical variables
+cats_to_plot <- c("Channel","PolicyType","Region")
+for (v in cats_to_plot) {
+  p <- ggplot(df, aes(x = .data[[v]], fill = Purchase)) +
+    geom_bar(position = "fill") +
+    scale_y_continuous(labels = scales::percent) +
+    labs(title = paste("Purchase Rate by", v), x = v, y = "Proportion") +
+    theme_minimal()
+  print(p)
+}
+
+
+```
+
+
+```{r data exploration - composite score variables}
+
+#means by purchase for each score
+df %>% group_by(Purchase) %>%
+     summarise(across(c(Score_Engagement, Score_Value, Score_Risk, Score_Upsell),
+                      mean, .names = "{.col}"), .groups = "drop")
+
+
+#We can use AUC value in predicting Purchase to check a composite relates to Purchase
+######## For Score_Engagement######
+roc_auc(df, truth = Purchase, Score_Engagement, event_level = "second")
+
+# For each constituent variable of Score_Engagement
+roc_auc(df, truth = Purchase, EmailOpens, event_level = "second")
+roc_auc(df, truth = Purchase, EmailClicks, event_level = "second")
+roc_auc(df, truth = Purchase, WebVisits, event_level = "second")
+
+#To check if the composite score adds value over all the constituent variables together
+#  -- first develop a linear model with only the constituent variables, and then with ScoreEngagement included
+base_mod <- glm(Purchase ~ EmailOpens + EmailClicks + WebVisits, data = df, family = binomial)
+ext_mod  <- glm(Purchase ~ EmailOpens + EmailClicks + WebVisits + Score_Engagement, data = df, family = binomial)
+
+#Next get the predicted probabilities of Purchase from the two models
+base_pred = predict(base_mod, type = "response")
+ext_pred  = predict(ext_mod, type = "response")
+#Then calculate their AUC values
+roc_auc_vec(truth = df$Purchase, base_pred, event_level = "second")
+roc_auc_vec(truth = df$Purchase, ext_pred,  event_level = "second")
+   #roc_auc_vec(..) does the same as roc_auc(..), but roc_auc_vec(..) uses vectors for the truth and predicted values
+
+#Note: in the above, we have developed a linear model on all the data, without training/test or cross-validation. This can be ok as a quick diagnostic; but use of cross-validation will give a more accurate picture
+
+
+
+#######For Score_Risk and its constituents Score_Risk beyond claims + incidents + late_payments
+roc_auc(df, truth = Purchase, Score_Risk, event_level = "second")
+
+base_mod <- glm(Purchase ~ ClaimsPastYear + Incidents3Y + LatePayments, data = df, family = binomial)
+ext_mod  <- glm(Purchase ~ ClaimsPastYear + Incidents3Y + LatePayments + Score_Risk, data = df, family = binomial)
+
+#Next get the predicted probabilities of Purchase from the two models
+base_pred = predict(base_mod, type = "response")
+ext_pred  = predict(ext_mod, type = "response")
+#Then calculate their AUC values
+roc_auc_vec(truth = df$Purchase, base_pred, event_level = "second")
+roc_auc_vec(truth = df$Purchase, ext_pred,  event_level = "second")
+
+
+########For Score_Value beyond purchases + tenure + prior_addons
+roc_auc(df, truth = Purchase, Score_Value, event_level = "second")
+
+base_mod <- glm(Purchase ~ OnlinePurchases + TenureMonths + PriorAddons, data = df, family = binomial)
+ext_mod  <- glm(Purchase ~ OnlinePurchases + TenureMonths + PriorAddons + Score_Value, data = df, family = binomial)
+
+#Next get the predicted probabilities of Purchase from the two models
+base_pred = predict(base_mod, type = "response")
+ext_pred  = predict(ext_mod, type = "response")
+#Then calculate their AUC values
+roc_auc_vec(truth = df$Purchase, base_pred, event_level = "second")
+roc_auc_vec(truth = df$Purchase, ext_pred,  event_level = "second")
+
+
+########What about Score_Upsell
+#For Score_Upsell, we can examine its value beyond prior addons + policy/channel + engagement 
+#  We can use the composite scoreEngagement for this, or use its components
+roc_auc(df, truth = Purchase, Score_Upsell, event_level = "second")
+
+base_mod <- glm(Purchase ~ PriorAddons + PolicyType + Channel + Score_Engagement, data = df, family = binomial)
+ext_mod  <- glm(Purchase ~ PriorAddons + PolicyType + Channel + Score_Engagement + Score_Upsell, data = df, family = binomial)
+
+#Next get the predicted probabilities of Purchase from the two models
+base_pred = predict(base_mod, type = "response")
+ext_pred  = predict(ext_mod, type = "response")
+#Then calculate their AUC values
+roc_auc_vec(truth = df$Purchase, base_pred, event_level = "second")
+roc_auc_vec(truth = df$Purchase, ext_pred,  event_level = "second")
+
+
+```
+
+
+#Develop models to predict Purchase
+```{r models}
+
+#Partition the data into training and test sets
+set.seed(2025)
+split  <- initial_split(df, prop = 0.7, strata = Purchase) #stratified train/test
+train  <- training(split)
+test   <- testing(split)
+
+```
+
+
+#rpart DT models
+```{r rpart}
+library(rpart)
+library(rpart.plot)  #for displaying the tree
+
+DT_rp1 <- rpart(Purchase ~ ., data = train, method = "class")
+
+# Check/inspect the tree
+print(DT_rp1)               # basic structure
+summary(DT_rp1)             # detailed splits, surrogates, etc.
+printcp(DT_rp1)             # cp table (xerror path)
+plotcp(DT_rp1)
+rpart.plot(DT_rp1, type = 2, extra = 104, fallen.leaves = TRUE)  # visualize
+DT_rp1$variable.importancce # Variable importance
+
+#What were the parameters uses in building this tree
+DT_rp1$control
+
+
+######Try with less strict parameters
+DT_rp2 <- rpart( Purchase ~ ., data = train, method = "class",
+  control = rpart.control(minsplit = 15,   # needed examples to split s
+                          minbucket = 10,   # smallest size leaves allowed
+                          cp = 0.001, maxdepth = 10))
+
+print(DT_rp2)
+
+#Plot the tree -- if the tree is large, you may needd to play with some of the parameters to get a reasonable display
+rpart.plot( DT_rp2,
+  type = 2,         # split labels at the nodes
+  extra = 104,      # show prob, n, and class
+  under = TRUE,     # put node info under the boxes
+  faclen = 0,       # show full variable names
+  cex = 0.5,        # enlarge text
+  tweak = 1.0       # enlarge everything proportionally
+)
+
+
+# predict using the tree prob for class "1" (positive)
+prob_1 <- predict(DT_rp2, newdata = test, type = "prob")[, "1"]
+# class prediction at 0.5 threshold
+pred_cls <- factor(ifelse(prob_1 >= 0.5, "1", "0"), levels = c("0","1"))
+#confusion matrix
+table(truth = test$Purchase, pred = pred_cls)
+
+#performance on training data
+prob_1 <- predict(DT_rp2, newdata = train, type = "prob")[, "1"]
+pred_cls <- factor(ifelse(prob_1 >= 0.5, "1", "0"), levels = c("0","1"))
+table(truth = train$Purchase, pred = pred_cls)
+
+
+#Will a different classification threshold work better?
+THRESH = 0.25
+pred_cls <- factor(ifelse(prob_1 >= THRESH, "1", "0"), levels = c("0","1"))
+#performance - confusion matrix related measures
+table(truth = train$Purchase, pred = pred_cls)
+
+
+#### Handle imbalanced classes by adjusting class priors
+# treat both classes as equally likely
+DT_rp_priors <- rpart( Purchase ~ ., data = train, method = "class",
+  parms = list(prior = c("0" = 0.5, "1" = 0.5))
+)
+
+print(DT_rp_priors)
+rpart.plot(DT_rp_priors)
+
+#basic check on performance --confusion matrix on training, test data
+prob_1 <- predict(DT_rp_priors, newdata = train, type = "prob")[, "1"]
+pred_cls <- factor(ifelse(prob_1 >= 0.5, "1", "0"), levels = c("0","1"))
+table(truth=train$Purchase, pred=pred_cls)
+#Next on test data
+prob_1 <- predict(DT_rp_priors, newdata = test, type = "prob")[, "1"]
+pred_cls <- factor(ifelse(prob_1 >= 0.5, "1", "0"), levels = c("0","1"))
+table(truth=test$Purchase, pred=pred_cls)
+
+
+
+####Use priors, and experiment with other parameters
+DT_rp_priors_2 <- rpart( Purchase ~ ., data = train, method = "class",
+  parms = list(prior = c("0" = 0.5, "1" = 0.5)),
+  control = rpart.control(minsplit = 15,   # needed examples to split s
+                          minbucket = 10,   # smallest size leaves allowed
+                          cp = 0.001, maxdepth = 10))
+
+#basic check on performance 
+prob_1 <- predict(DT_rp_priors_2, newdata = train, type = "prob")[, "1"]
+pred_cls <- factor(ifelse(prob_1 >= 0.5, "1", "0"), levels = c("0","1"))
+table(truth=train$Purchase, pred=pred_cls)
+#Next on test data
+prob_1 <- predict(DT_rp_priors_2, newdata = test, type = "prob")[, "1"]
+pred_cls <- factor(ifelse(prob_1 >= 0.5, "1", "0"), levels = c("0","1"))
+table(truth=test$Purchase, pred=pred_cls)
+
+
+#Another tree with different parameters
+DT_rp_priors_3<- rpart( Purchase ~ ., data = train, method = "class",
+  parms = list(prior = c("0" = 0.5, "1" = 0.5)),
+  control = rpart.control(minsplit = 15,   # needed examples to split s
+                          minbucket = 10,   # smallest size leaves allowed
+                          cp = 0.005, maxdepth = 10))
+
+#basic check on performance 
+prob_1 <- predict(DT_rp_priors_3, newdata = train, type = "prob")[, "1"]
+pred_cls <- factor(ifelse(prob_1 >= 0.5, "1", "0"), levels = c("0","1"))
+table(truth=train$Purchase, pred=pred_cls)
+#Next on test data
+prob_1 <- predict(DT_rp_priors_3, newdata = test, type = "prob")[, "1"]
+pred_cls <- factor(ifelse(prob_1 >= 0.5, "1", "0"), levels = c("0","1"))
+table(truth=test$Purchase, pred=pred_cls)
+
+
+```
+
+
+#Performance assessment, includind ROC, lift
+```{r Performance assessment}
+
+#Get predicted score, and predicted class
+prob_1 <- predict(DT_rp_priors_3, newdata = train, type = "prob")[, "1"]
+pred_cls <- factor(ifelse(prob_1 >= 0.5, "1", "0"), levels = c("0","1"))
+
+#performance - confusion matrix related measures
+cm <- table(truth = train$Purchase, pred = pred_cls)
+print(cm)
+
+TP <- cm["1","1"]; TN <- cm["0","0"]; FP <- cm["0","1"]; FN <- cm["1","0"]
+accuracy  <- (TP + TN) / sum(cm)
+precision <- TP / (TP + FP)
+recall    <- TP / (TP + FN)
+c(accuracy = accuracy, precision = precision, recall = recall)
+
+
+#### You may like to write a function which you can call for different models
+cmMetrics <- function( scores,  actualClass, THR=0.5){
+  pred_cls <- factor(ifelse(scores >= THR, "1", "0"), levels = c("0","1"))
+  cm <- table(truth = actualClass, pred = pred_cls)
+  print(cm)
+  TP <- cm["1","1"]; TN <- cm["0","0"]; FP <- cm["0","1"]; FN <- cm["1","0"]
+  accuracy  <- (TP + TN) / sum(cm)
+  precision <- TP / (TP + FP)
+  recall    <- TP / (TP + FN)
+  c(accuracy = accuracy, precision = precision, recall = recall)
+}
+
+#call this function to get performance metrics on training, test data
+prob_trn <- predict(DT_rp_priors_3, newdata = train, type = "prob")[, "1"]
+cmMetrics(prob_trn, train$Purchase)
+prob_tst <- predict(DT_rp_priors_3, newdata = test, type = "prob")[, "1"]
+cmMetrics(prob_tst, test$Purchase)
+
+
+#Compare with a different DT model
+prob_trn <- predict(DT_rp_priors_2, newdata = train, type = "prob")[, "1"]
+cmMetrics(prob_trn, train$Purchase)
+prob_tst <- predict(DT_rp_priors_2, newdata = test, type = "prob")[, "1"]
+cmMetrics(prob_tst, test$Purchase)
+
+
+
+
+###### ROC curves, AUC
+library(pROC)
+
+# ROC calculations
+roc_trn <- roc(train$Purchase, prob_trn, levels = c("0","1"))
+auc(roc_trn) #AUC value
+
+#For the test data
+roc_tst <- roc(test$Purchase, prob_tst, levels = c("0","1"))
+auc(roc_tst)
+
+#Plot the ROC curve for the training data
+plot(roc_trn, col = "blue", main = sprintf("ROC Curves"), lwd=2)
+
+#Add the ROC curve for the test data to this plot
+lines(roc_tst, col = "red", lwd = 2, lty = 2)
+
+#Add a legend to the plot
+legend("bottomright",
+       legend = c(
+         sprintf("Train AUC = %.3f", auc(roc_trn)),
+         sprintf("Test AUC  = %.3f", auc(roc_tst)) ),
+       col = c("blue", "red"), lwd = 2, lty = c(1, 2))
+
+
+#We can also obtain the AUC value as
+auc(train$Purchase, prob_trn, levels = c("0","1"), direction = "<")
+auc(test$Purchase, prob_tst, levels = c("0","1"), direction = "<")
+    #the direction = "<" parameter helps avoid a warning message
+
+
+
+#### Decile lift table
+
+#Create a data-frame with only the model scores and the actual class (PURCHASE) values
+dfLifts<-train %>% select(Purchase)   # selects the Purchase column into dfLifts
+
+#add a column with prediction scores (predicted prob of '1')
+dfLifts$score <- predict(DT_rp_priors_3, newdata = train, type = "prob")[, "1"] 
+#This is the same as 
+# prob_trn <- predict(DT_rp_priors_3, newdata = train, type = "prob")[, "1"]
+# dfLifts$score <- prob_trn  
+
+#Divide the data into 10 (for decile) equal groups based on descending values of score
+dfLifts$bucket <- ntile(dplyr::desc(dfLifts$score), 10)  # top scores = bucket 1  
+     # this creates a new column with group number for each row. Take a look at dLifts 
+
+#group the data by the 'buckets', and obtain summary statistics 
+dLifts <- dfLifts %>% group_by(bucket) %>% 
+    summarize(count = n(), numResponse = sum(Purchase == "1"), .groups = "drop" ) %>%
+    arrange(bucket) %>%  # ensure 1..10
+    mutate(respRate = numResponse / count, cumN = cumsum(count), cumResp = cumsum(numResponse), 
+           cumRespRate = cumResp / cumN, lift = cumRespRate / (sum(numResponse) / sum(count))
+    )
+dLifts
+
+
+#You can write a function to obtain a decile table
+decileLifts <- function(scores,  actualClass ){
+  dfLifts <- data.frame(Purchase = actualClass, score = scores)
+  dfLifts$bucket <- ntile(dplyr::desc(dfLifts$score), 10)  # top scores = bucket 1
+  
+  dLifts <- dfLifts %>% group_by(bucket) %>% 
+    summarize(count = n(), numResponse = sum(Purchase == "1"), .groups = "drop" ) %>%
+    arrange(bucket) %>%  # ensure 1..10
+    mutate(respRate = numResponse / count, cumN = cumsum(count),
+      cumResp  = cumsum(numResponse), cumRespRate = cumResp / cumN,
+      lift = cumRespRate / (sum(numResponse) / sum(count))
+    )
+  dLifts
+}
+
+
+#Then call this function to get decile lifts
+prob_trn <- predict(DT_rp_priors_3, newdata = train, type = "prob")[, "1"]
+decileLifts(prob_trn, train$Purchase)
+
+prob_tst <- predict(DT_rp_priors_3, newdata = test, type = "prob")[, "1"]
+decileLifts(prob_tst, test$Purchase)
+
+  
+
+
+```
+
+
+
+#c50 decision tree models
+```{r randomForests}
+library(C50)
+
+c50_baseline <- C5.0(Purchase ~ ., data = train)
+
+summary(c50_baseline)
+
+##### Using misclassification costs while building the model
+#To account for class imbalance in the data,one approach is to use misclassification costs, 
+#   with higher costs for the minority class 
+costs <- matrix(c(0,1, 5,0), nrow = 2,
+                dimnames = list(truth = c("0","1"), predicted = c("0","1")))
+
+c50_cost <- C5.0(Purchase ~ ., data = train,
+                 trials = 1,
+                 costs = costs,
+                 control = C5.0Control(CF = 0.5, minCases = 20))
+
+#When using cost matrix to build the model, the c50 predict function returns predicted class values, not probabilities
+#So, we can only use the prediction results to get the confusion matrix.  We would need predicted probabilities for ROC, Lifts etc.
+pred_trn <- predict(c50_cost, newdata=train)
+cm <- table(truth = train$Purchase, pred = pred_trn)
+print(cm)
+TP <- cm["1","1"]; TN <- cm["0","0"]; FP <- cm["0","1"]; FN <- cm["1","0"]
+accuracy  <- (TP + TN) / sum(cm)
+precision <- TP / (TP + FP)
+recall    <- TP / (TP + FN)
+c(accuracy = accuracy, precision = precision, recall = recall)
+
+pred_tst <- predict(c50_cost, newdata=test)
+cm <- table(truth = test$Purchase, pred = pred_tst)
+print(cm)
+TP <- cm["1","1"]; TN <- cm["0","0"]; FP <- cm["0","1"]; FN <- cm["1","0"]
+accuracy  <- (TP + TN) / sum(cm)
+precision <- TP / (TP + FP)
+recall    <- TP / (TP + FN)
+c(accuracy = accuracy, precision = precision, recall = recall)
+
+
+
+######### Using case weights to address data imbalance
+##To get predicted probabilities, we can try to use example weights instead of the cost-matrix.
+
+#Use Case weights (e.g., 1:5)
+w <- ifelse(train$Purchase == "1", 5, 1)
+c50_wt <- C5.0(Purchase ~ ., data = train,
+  trials = 1,                                  # single tree, no boosting
+  weights = w,                                 # <-- weights, not costs
+  control = C5.0Control(CF = 0.25, minCases = 10)
+)
+
+#Evaluate performance
+prob_trn <- predict(c50_wt, newdata = train, type = "prob")[, "1"]
+cmMetrics(prob_trn, train$Purchase)
+auc(train$Purchase, prob_trn, levels = c("0","1"), direction = "<") #AUC value
+
+prob_tst <- predict(c50_wt, newdata = test, type = "prob")[, "1"]
+cmMetrics(prob_tst, test$Purchase)
+auc(test$Purchase, prob_tst, levels = c("0","1"), direction = "<")
+
+decileLifts(prob_trn, train$Purchase)
+decileLifts(prob_tst, test$Purchase)
+
+
+
+#Try with different weights, and parameters
+w <- ifelse(train$Purchase == "1", 10, 1)
+c50_wt2 <- C5.0(Purchase ~ ., data = train,
+               trials = 1,                                  # single tree, no boosting
+               weights = w,                                 # <-- weights, not costs
+               control = C5.0Control(CF = 0.25, minCases = 30)
+)
+
+#Evaluate performance
+
+
+
+```
+
+
+
+
+#Random forest models
+```{r Random Forests}
+
+library(ranger)
+
+rf_simple <- ranger( Purchase ~ ., data = train, probability = TRUE)
+rf_simple
+rf_simple$prediction.error #oob prediction error
+
+prob_trn <- predict(rf_simple, data = train)$predictions[, "1"]
+cmMetrics(prob_trn, train$Purchase)
+auc(train$Purchase, prob_trn, levels = c("0","1"), direction = "<")
+prob_tst <- predict(rf_simple, data = test)$predictions[, "1"]
+cmMetrics(prob_tst, test$Purchase)
+auc(test$Purchase, prob_tst, levels = c("0","1"), direction = "<")
+
+
+#Given imbalanced data, a classification threshold other than 0.5 may be better?
+cmMetrics(prob_trn, train$Purchase, 0.2)
+cmMetrics(prob_tst, test$Purchase, 0.2)
+
+#Decile performance
+decileLifts(prob_trn, train$Purchase)
+decileLifts(prob_tst, test$Purchase)
+
+
+
+##### Try changing some parameters
+rf_tuned <- ranger(Purchase ~ ., data = train, probability = TRUE,
+  num.trees = 500,
+  mtry = floor(sqrt(ncol(train) - 1)),  # default
+  min.node.size = 50,                   # force larger leaves
+  sample.fraction = 0.7                 # use only 70% of data per tree
+)
+
+#Evaluate performance
+
+
+#### Use class weights to handle imbalanced data
+rf_wt <- ranger( Purchase ~ ., data = train, probability = TRUE,
+  num.trees = 500,
+  min.node.size = 50,
+  class.weights = c("0" = 1, "1" = 8)  # upweight positives
+)
+
+#Evaluate performance
+
+
+
+#Try other parameter settings
+rf_wt2 <- ranger( Purchase ~ ., data = train, probability = TRUE,
+  num.trees = 500,
+  min.node.size = 50,
+  sample.fraction = 0.7,                 # use only 70% of data per tree
+  class.weights = c("0" = 1, "1" = 8)  # upweight positives
+)
+
+#Evaluate performance
+
+
+rf_wt3 <- ranger( Purchase ~ ., data = train, probability = TRUE,
+                  num.trees = 500, min.node.size = 20, min.bucket = 10, max.depth = 25,
+                  sample.fraction = 0.7,                 # use only 70% of data per tree
+                  class.weights = c("0" = 1, "1" = 10)  # upweight positives
+)
+
+#Evaluate performance
+
+
+
+```
+
+
+
+#knn models
+```{r knn}
+library(class)
+
+#knn requires numeric variables, and all variables in similar range
+
+# One-hot encode for factor variables -- for training data 
+Xtr <- model.matrix(Purchase ~ . - 1, data = train)
+ytr <- train$Purchase
+
+# One-hot encode (test) 
+Xte <- model.matrix(Purchase ~ . - 1, data = test)
+
+#Standardize the numeric variables
+ctr <- colMeans(Xtr)
+sds <- apply(Xtr, 2, sd)
+sds[sds == 0] <- 1  # avoid divide-by-zero
+
+Xtr_sc <- scale(Xtr, center = ctr, scale = sds)
+Xte_sc <- scale(Xte, center = ctr, scale = sds)
+
+#knn model
+set.seed(15)
+
+k <- 11  # start with an odd k (why?)
+knn_predClass <- knn(train = Xtr_sc, test = Xte_sc, cl = ytr, k = k, prob = TRUE)
+# knn  returns the predicted class of the test data.
+
+# With prob = TRUE, it also gives the vote proportions for the predicted class
+# We can use this to get the predicted class probabilities
+# Convert vote proportions to P(class = "1")
+vote_win <- attr(knn_predClass, "prob")           # P(winning class)
+prob_1 <- ifelse(knn_predClass == "1", vote_win, 1 - vote_win)
+
+#Evaluate performance
+cmMetrics(prob_1, test$Purchase)
+#Or maybe a different classification threshold is better, consideriong class imbalance
+cmMetrics(prob_1, test$Purchase, 0.1)
+#Decile table
+decileLifts(prob_1, test$Purchase)
+#We can also get the AUC using 
+auc(test$Purchase, prob_1, levels = c("0","1"), direction = "<")
+
+
+#Performance on training data 
+knn_predClass <- knn(train = Xtr_sc, test = Xtr_sc, cl = ytr, k = k, prob = TRUE)
+vote_win <- attr(knn_predClass, "prob")           # P(winning class)
+prob_1 <- ifelse(knn_predClass == "1", vote_win, 1 - vote_win)
+cmMetrics(prob_1, train$Purchase, 0.1)
+decileLifts(prob_1, train$Purchase)
+
+auc(train$Purchase, prob_1, levels = c("0","1"), direction = "<")
+
+
+
+#### To experiment with multiple values of k
+try_ks <- seq(5, 100, 5) #sequence of values from 5 to 50, in steps of 5
+
+results <- lapply(try_ks, function(k) {
+  pc <- knn(train = Xtr_sc, test = Xte_sc, cl = ytr, k = k, prob = TRUE)
+  vw <- attr(pc, "prob")
+  p1 <- ifelse(pc == "1", vw, 1 - vw)
+  c(k = k, AUC = as.numeric(auc(test$Purchase, p1, levels = c("0","1"), direction = "<")) )
+} )
+
+results <- bind_rows(results)  #since lapply returns a list of results
+results
+
+```
+
+
+
+#Linear model (logistic)
+```{r linear model}
+
+# Fit a logistic regression (generalized linear model)
+glm_mod <- glm(Purchase ~ ., data = train, family = binomial)
+
+summary(glm_mod)   # coefficients, p-values
+
+# Predicted probabilities for class "1" on test data
+prob_tst <- predict(glm_mod, newdata = test, type = "response")
+
+#Performance
+cmMetrics(prob_tst, test$Purchase, 0.1)
+auc(test$Purchase, prob_tst, levels = c("0","1"), direction = "<")
+decileLifts(prob_tst, test$Purchase)
+
+#Performance on training data
+prob_trn <- predict(glm_mod, newdata = train, type = "response")
+cmMetrics(prob_trn, train$Purchase, 0.1)
+auc(train$Purchase, prob_trn, levels = c("0","1"), direction = "<")
+decileLifts(prob_trn, train$Purchase)
+
+
+```
+
+
+
+#Combined ROC curves for multiple models
+```{r combined roc plots}
+
+#Get scores (predicted probs for '1') on test data, for different models
+rp_prob_tst <- predict(DT_rp_priors_3, newdata = test, type = "prob")[, "1"]  #for a rpart model 
+c5_prob_tst <- predict(c50_wt2, newdata = test, type = "prob")[, "1"]  #for a c50 model 
+glm_prob_tst <- predict(glm_mod, newdata = test, type = "response")  # for linear model
+rf_prob_tst <- predict(rf_wt3, data = test)$predictions[, "1"]
+
+#For knn:
+knn_predClass <- knn(train = Xtr_sc, test = Xte_sc, cl = ytr, k = 50, prob = TRUE)
+vote_win <- attr(knn_predClass, "prob")           # P(winning class)
+knn50_prob_tst <- ifelse(knn_predClass == "1", vote_win, 1 - vote_win)
+
+#Get the roc values
+rp_roc_tst <- roc(test$Purchase, rp_prob_tst, levels = c("0","1"))
+c5_roc_tst <- roc(test$Purchase, c5_prob_tst, levels = c("0","1"))
+glm_roc_tst <- roc(test$Purchase, glm_prob_tst, levels = c("0","1"))
+rf_roc_tst <- roc(test$Purchase, rf_prob_tst, levels = c("0","1"))
+knn50_roc_tst <- roc(test$Purchase, knn50_prob_tst, levels = c("0","1"))
+
+
+#Plot the ROC curves
+plot(rp_roc_tst, col = "blue", main = sprintf("ROC Curves (test)"), lwd=2)
+
+#Add the ROC curves for the other models
+lines(c5_roc_tst, col = "green", lwd = 2, lty = 1)
+lines(glm_roc_tst, col = "red", lwd = 2, lty = 1)
+lines(rf_roc_tst, col = "pink", lwd = 2, lty = 1)
+lines(knn50_roc_tst, col = "black", lwd = 2, lty = 1)
+
+
+#Add a legend to the plot
+legend("bottomright",
+       legend = c(
+         sprintf("rpart  AUC = %.3f", auc(rp_roc_tst)),
+         sprintf("c5  AUC  = %.3f", auc(c5_roc_tst)),
+         sprintf("glm  AUC  = %.3f", auc(glm_roc_tst)),
+         sprintf("rf  AUC  = %.3f", auc(rf_roc_tst)),
+         sprintf("knn50  AUC  = %.3f", auc(knn50_roc_tst)) ),
+       col = c("blue", "green", "red", "pink", "black"), lwd = 2, lty = 1, cex=0.8 )
+
+
+```
+
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
