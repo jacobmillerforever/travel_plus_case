@@ -1,6 +1,6 @@
 # ----------------------------------------------------------------------------
 # Assignment 1 (IDS 572) - TravelPlus RoadsidePlus Case Study
-# Contributor: Analyst 1 - Exploratory Data Analysis Lead
+# Contributor: Jacob Miller - Exploratory Data Analysis Lead
 #
 # Objective:
 #   Outline all exploratory analyses required to understand the dataset,
@@ -20,31 +20,50 @@
 #
 # ---------------------------------------------------------------------------
 # 1) Set up environment
-#   - Load tidyverse (or preferred plotting/EDA libraries) for data wrangling,
-#     visualization, and table creation.
-#   - Import helper packages for summary statistics (e.g., skimr, janitor).
-#   - Read the TravelPlus dataset and immediately inspect structure (str, glimpse)
-#     to confirm data types match expectations from the case brief.
-#   - Audit missing values globally and by column; decide whether to flag any
-#     variables with high missingness for imputation or exclusion.
-#
+
+library(tidyverse)
+library(skimr)
+library(broom)
+
+
+df <- readr::read_csv("data/dataTravelPlus.csv")
+skim(df)
+
 # 2) Compute baseline metrics
 #   - Calculate the overall Purchase rate (Yes vs. No) for the contacted group.
-#   - Produce a simple summary table showing counts and percentages for Purchase.
-#   - Capture insights in comments for the business narrative (e.g., confirm the
-#     ~8% response rate mentioned in the case description).
-#
+
+print(paste("Of the 20,000 people contacted", sum(df$Purchase), "or",sum(df['Purchase'])/20000 * 100,"%, purchased the add on travel insurance."))
+
 # 3) Explore numeric predictors versus Purchase
-#   - Identify numeric columns (demographics, engagement, spending, scores, etc.).
-#   - For each numeric variable:
-#       * Create side-by-side visualizations (boxplots, density plots, violin plots)
-#         comparing purchasers vs. non-purchasers.
-#       * Compute group-level summary statistics (mean, median, standard deviation)
-#         and capture differences in a comparison table.
-#       * Flag variables that show noticeable separation between Purchase groups.
-#   - Consider adding correlation analysis or standardized mean differences to
-#     quantify effect sizes.
-#
+
+
+num_vars <- names(df)[sapply(df, is.numeric)]
+num_vars <- setdiff(num_vars, "Purchase")
+
+for (v in num_vars) {
+  boxplot(df[[v]] ~ df$Purchase,
+          main = paste("Boxplot of", v, "by Purchase"),
+          xlab = "Purchase",
+          ylab = v,
+          col = c("lightblue", "salmon"))
+}
+
+
+
+results_num <- data.frame(var = character(), r2 = numeric(), stringsAsFactors = FALSE)
+
+for (v in num_vars) {
+  f <- as.formula(paste("Purchase ~", v))
+  fit <- glm(f, data = df, family = binomial)
+  fit_null <- glm(Purchase ~ 1, data = df, family = binomial)
+  r2 <- 1 - (as.numeric(logLik(fit)) / as.numeric(logLik(fit_null)))
+  results_num <- rbind(results_num, data.frame(var = v, r2 = r2))
+}
+
+# Sort by R^2 descending
+results_num <- results_num[order(-results_num$r2), ]
+print(results_num)
+
 # 4) Explore categorical predictors versus Purchase
 #   - Identify categorical variables (Region, MaritalStatus, HomeOwner, etc.).
 #   - For each categorical variable:
@@ -54,7 +73,57 @@
 #         whether category distributions differ significantly between purchasers
 #         and non-purchasers.
 #       * Annotate findings on categories that appear predictive vs. noisy.
-#
+cat_vars <- names(df)[sapply(df, function(x) is.factor(x) || is.character(x))]
+
+# bar plots of purchase rate
+for (v in cat_vars) {
+  # Compute purchase rate by category
+  tab <- tapply(df$Purchase, df[[v]], mean, na.rm = TRUE)
+  
+  # Make barplot
+  barplot(tab,
+          main = paste("Purchase Rate by", v),
+          ylab = "Purchase Rate",
+          xlab = v,
+          ylim = c(0, max(tab, na.rm = TRUE) * 1.1),
+          col = "skyblue")
+  
+  # Add % labels above bars
+  text(x = seq_along(tab),
+       y = tab,
+       labels = paste0(round(100*tab, 1), "%"),
+       pos = 3, cex = 0.8)
+}
+
+for (v in cat_vars) {
+  tab <- table(df$Purchase, df[[v]])
+  tab
+  print(v)
+  print(chisq.test(tab))
+}
+
+
+
+
+results_cat <- data.frame(var = character(), r2 = numeric())
+
+for (var in cat_vars) {
+  form <- as.formula(paste("Purchase ~", var, "- 1"))
+  fit <- glm(form, data = df, family = binomial)
+  fit_null <- glm(Purchase ~ 1, data = df, family = binomial)
+  r2_val <- 1 - (as.numeric(logLik(fit)) / as.numeric(logLik(fit_null)))
+  results_cat <- rbind(results_cat, data.frame(var = var, r2 = r2_val))
+}
+
+print(results_cat)
+
+
+
+results_all <- bind_rows(results_num, results_cat) %>%
+  arrange(desc(r2))
+
+print(results_all)
+
 # 5) Evaluate lifestyle variables specifically
 #   - Compile all lifestyle fields (StreamingHours, PetOwnership, CommuteDistance,
 #     DiningOutFreq, AppDownloads) into focused visualizations and summaries.
@@ -62,7 +131,10 @@
 #     (e.g., overlay distributions, compute mutual information, etc.).
 #   - Provide explicit commentary on whether the data supports Joi's intuition
 #     that lifestyle variables may mostly add noise.
-#
+
+
+
+
 # 6) Examine composite scores
 #   - For each score (Score_Engagement, Score_Value, Score_Risk, Score_Upsell):
 #       * Plot score distributions stratified by Purchase (boxplot/violin/histogram).
@@ -83,7 +155,4 @@
 #     needs identified (e.g., skewed distributions requiring transformation).
 #   - Save all plots/tables to an output folder (if needed) for inclusion in the
 #     final report.
-#
-# NOTE: Do not implement modeling here—this script strictly documents exploratory
-#       steps and observations for the case study handoff.
-# ----------------------------------------------------------------------------
+
