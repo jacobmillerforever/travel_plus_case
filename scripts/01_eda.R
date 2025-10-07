@@ -25,62 +25,74 @@ library(yardstick)
 
 
 df <- readr::read_csv("data/dataTravelPlus.csv")
+
+df <- df %>%
+  mutate(
+    Purchase = factor(Purchase, levels = c(0, 1)),
+    Purchase_num = as.integer(Purchase) - 1L   
+  )
+
 skim(df)
 
 # 2) Compute baseline metrics
 #   - Calculate the overall Purchase rate (Yes vs. No) for the contacted group.
+n_total   <- nrow(df)
+n_buyers  <- sum(df$Purchase_num)
+buy_rate  <- mean(df$Purchase_num) * 100
 
-print(paste("Of the 20,000 people contacted", sum(df$Purchase), "or",sum(df['Purchase'])/20000 * 100,"%, purchased the add on travel insurance."))
+cat(
+  sprintf(
+    "Of the %d people contacted, %d (%.1f%%) purchased the add-on travel insurance.\n",
+    n_total, n_buyers, buy_rate
+  )
+)
 
 # 3) Explore numeric predictors versus Purchase
-df <- df %>% mutate(Purchase = factor(Purchase, levels = c(0, 1)))
 
 num_vars <- df %>% select(where(is.numeric)) %>% names()
-num_vars_plot <- setdiff(num_vars, "Purchase")
-cat_vars <- df %>% select(where(is.character)) %>% names()
+num_vars <- setdiff(num_vars, c("Purchase_num"))
+cat_vars <- df %>% select(where(~ is.character(.x) || is.factor(.x))) %>% names()
+cat_vars <- setdiff(cat_vars, "Purchase")    
+
+
 
 #Summary stats(mean, min, max) by Purchase across all numeric variables
-num_summary<- df %>% group_by(Purchase) %>% summarise(across(all_of(num_vars),list(
-  mean = mean, min  = min, max  = max), .names = "{.col}_{.fn}") )
-
+num_summary <- df %>%
+  group_by(Purchase) %>%
+  summarise(
+    across(all_of(num_vars), list(mean = mean, min = min, max = max),
+           .names = "{.col}_{.fn}"),
+    .groups = "drop"
+  )
 
 for (v in num_vars) {
-  # Run Welch two-sample t-test
-  test <- t.test(df[[v]] ~ df$Purchase)
-  
-  # Extract results
+  test  <- t.test(df[[v]] ~ df$Purchase)
   t_val <- round(test$statistic, 2)
   dfree <- round(test$parameter, 1)
-  pval <- test$p.value
-  p_label <- ifelse(pval < 0.001, "< 0.001", sprintf("= %.3f", pval))
+  pval  <- test$p.value
+  p_lab <- ifelse(pval < 0.001, "< 0.001", sprintf("= %.3f", pval))
   
-  # Create annotated plot
   p <- ggplot(df, aes(x = Purchase, y = .data[[v]], fill = Purchase)) +
     geom_boxplot() +
     labs(
-      title = paste("Boxplot:", v, "by Purchase"),
-      subtitle = paste0("t = ", t_val, ", df = ", dfree, ", p ", p_label),
-      x = "Purchase",
-      y = v
+      title    = paste("Boxplot:", v, "by Purchase"),
+      subtitle = paste0("t = ", t_val, ", df = ", dfree, ", p ", p_lab),
+      x = "Purchase", y = v
     ) +
-    theme_minimal() +
-    theme(legend.position = "none")
-  
+    theme_minimal() + theme(legend.position = "none")
   print(p)
 }
 
 one_var_auc <- function(v) {
   f  <- as.formula(paste("Purchase ~", v))
-  mf <- model.frame(f, data = df)                 # common rows, handles NAs
+  mf <- model.frame(f, data = df)                 # drops rows with NA in either col
   fit <- glm(f, data = mf, family = binomial)
-  p   <- fitted(fit)                              # predicted probabilities
+  p   <- fitted(fit)
   auc <- roc_auc_vec(truth = mf$Purchase, estimate = p, event_level = "second")
   tibble(var = v, auc = auc)
 }
 
-results_num <- map_dfr(num_vars, one_var_auc) %>%
-  arrange(desc(auc))
-
+results_num <- purrr::map_dfr(num_vars, one_var_auc) %>% arrange(desc(auc))
 print(results_num)
 
 
@@ -93,63 +105,49 @@ print(results_num)
 #         whether category distributions differ significantly between purchasers
 #         and non-purchasers.
 #       * Annotate findings on categories that appear predictive vs. noisy.
-cat_vars <- names(df)[sapply(df, function(x) is.factor(x) || is.character(x))]
-
-chi_results <- data.frame(
-  variable = character(),
-  df = numeric(),
-  X2 = numeric(),
-  p_value = numeric(),
-  stringsAsFactors = FALSE
-)
-
-# Assumes Purchase has levels c("0","1") or c(0, 1) and "1" is the positive class
-pos_lvl <- levels(df$Purchase)[2]
+chi_results <- data.frame(variable = character(), df = numeric(),
+                          X2 = numeric(), p_value = numeric(), stringsAsFactors = FALSE)
 
 for (v in cat_vars) {
-  # Purchase rate by category (as a mean of TRUE/FALSE)
-  tab <- with(df, tapply(Purchase == pos_lvl, df[[v]], mean, na.rm = TRUE))
-  
+  tab <- table(df[[v]], df$Purchase_num)
+  chi <- chisq.test(tab)
+  chi_results <- rbind(
+    chi_results,
+    data.frame(
+      variable = v,
+      df = chi$parameter,
+      X2 = chi$statistic,
+      p_value = chi$p.value
+    )
+  )
+}
 
+
+for (v in cat_vars) {
+  tab <- with(df, tapply(Purchase_num, df[[v]], mean, na.rm = TRUE))
   
-  # Pull chi-square row if present
   chi_row <- chi_results[chi_results$variable == v, ]
   x2   <- if (nrow(chi_row)) round(chi_row$X2, 2) else NA_real_
   pval <- if (nrow(chi_row)) chi_row$p_value else NA_real_
-  p_label <- if (is.na(pval)) "NA"
-  else if (pval < 0.001) "< 0.001"
-  else sprintf("= %.3f", pval)
+  p_lab <- if (is.na(pval)) "NA" else if (pval < 0.001) "< 0.001" else sprintf("= %.3f", pval)
   
-  ymax <- max(tab, na.rm = TRUE)
-  if (!is.finite(ymax)) next
+  ymax <- max(tab, na.rm = TRUE); if (!is.finite(ymax)) next
   
   barplot(tab,
           main = paste("Purchase Rate by", v),
-          sub  = bquote(chi^2 == .(x2) ~ ", p" ~ .(p_label)),
-          ylab = "Purchase Rate",
-          xlab = v,
-          ylim = c(0, ymax * 1.1),
-          col  = "skyblue")
+          sub  = bquote(chi^2 == .(x2) ~ ", p " ~ .(p_lab)),
+          ylab = "Purchase Rate", xlab = v,
+          ylim = c(0, ymax * 1.1), col = "skyblue")
   
-  text(x = seq_along(tab),
-       y = tab,
+  text(x = seq_along(tab), y = tab,
        labels = paste0(round(100 * tab, 1), "%"),
        pos = 3, cex = 0.8)
 }
 
-
-
-results_cat <- map_dfr(cat_vars, one_var_auc) %>%
-  arrange(desc(auc))
-
+results_cat <- purrr::map_dfr(cat_vars, one_var_auc) %>% arrange(desc(auc))
 print(results_cat)
 
-
-
-
-results_all <- bind_rows(results_num, results_cat) %>%
-  arrange(desc(auc))
-
+results_all <- dplyr::bind_rows(results_num, results_cat) %>% arrange(desc(auc))
 print(results_all)
 
 # 5) Evaluate lifestyle variables specifically
