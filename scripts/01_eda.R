@@ -7,9 +7,6 @@
 #   characterize purchase behavior, and evaluate signal strength of different
 #   predictor groups before any modeling begins.
 #
-# Data Inputs Needed:
-#   - data/dataTravelPlus.csv (contacted customers only)
-#   - Description of variables from travel_plus_case_assignment.md
 #
 # Key Deliverables for this Script:
 #   1. Overall purchase rate for contacted customers.
@@ -24,6 +21,7 @@
 library(tidyverse)
 library(skimr)
 library(broom)
+library(yardstick)
 
 
 df <- readr::read_csv("data/dataTravelPlus.csv")
@@ -35,34 +33,56 @@ skim(df)
 print(paste("Of the 20,000 people contacted", sum(df$Purchase), "or",sum(df['Purchase'])/20000 * 100,"%, purchased the add on travel insurance."))
 
 # 3) Explore numeric predictors versus Purchase
+df <- df %>% mutate(Purchase = factor(Purchase, levels = c(0, 1)))
 
+num_vars <- df %>% select(where(is.numeric)) %>% names()
+num_vars_plot <- setdiff(num_vars, "Purchase")
+cat_vars <- df %>% select(where(is.character)) %>% names()
 
-num_vars <- names(df)[sapply(df, is.numeric)]
-num_vars <- setdiff(num_vars, "Purchase")
+#Summary stats(mean, min, max) by Purchase across all numeric variables
+num_summary<- df %>% group_by(Purchase) %>% summarise(across(all_of(num_vars),list(
+  mean = mean, min  = min, max  = max), .names = "{.col}_{.fn}") )
+
 
 for (v in num_vars) {
-  boxplot(df[[v]] ~ df$Purchase,
-          main = paste("Boxplot of", v, "by Purchase"),
-          xlab = "Purchase",
-          ylab = v,
-          col = c("lightblue", "salmon"))
+  # Run Welch two-sample t-test
+  test <- t.test(df[[v]] ~ df$Purchase)
+  
+  # Extract results
+  t_val <- round(test$statistic, 2)
+  dfree <- round(test$parameter, 1)
+  pval <- test$p.value
+  p_label <- ifelse(pval < 0.001, "< 0.001", sprintf("= %.3f", pval))
+  
+  # Create annotated plot
+  p <- ggplot(df, aes(x = Purchase, y = .data[[v]], fill = Purchase)) +
+    geom_boxplot() +
+    labs(
+      title = paste("Boxplot:", v, "by Purchase"),
+      subtitle = paste0("t = ", t_val, ", df = ", dfree, ", p ", p_label),
+      x = "Purchase",
+      y = v
+    ) +
+    theme_minimal() +
+    theme(legend.position = "none")
+  
+  print(p)
 }
 
-
-
-results_num <- data.frame(var = character(), r2 = numeric(), stringsAsFactors = FALSE)
-
-for (v in num_vars) {
-  f <- as.formula(paste("Purchase ~", v))
-  fit <- glm(f, data = df, family = binomial)
-  fit_null <- glm(Purchase ~ 1, data = df, family = binomial)
-  r2 <- 1 - (as.numeric(logLik(fit)) / as.numeric(logLik(fit_null)))
-  results_num <- rbind(results_num, data.frame(var = v, r2 = r2))
+one_var_auc <- function(v) {
+  f  <- as.formula(paste("Purchase ~", v))
+  mf <- model.frame(f, data = df)                 # common rows, handles NAs
+  fit <- glm(f, data = mf, family = binomial)
+  p   <- fitted(fit)                              # predicted probabilities
+  auc <- roc_auc_vec(truth = mf$Purchase, estimate = p, event_level = "second")
+  tibble(var = v, auc = auc)
 }
 
-# Sort by R^2 descending
-results_num <- results_num[order(-results_num$r2), ]
+results_num <- map_dfr(num_vars, one_var_auc) %>%
+  arrange(desc(auc))
+
 print(results_num)
+
 
 # 4) Explore categorical predictors versus Purchase
 #   - Identify categorical variables (Region, MaritalStatus, HomeOwner, etc.).
@@ -75,52 +95,60 @@ print(results_num)
 #       * Annotate findings on categories that appear predictive vs. noisy.
 cat_vars <- names(df)[sapply(df, function(x) is.factor(x) || is.character(x))]
 
-# bar plots of purchase rate
+chi_results <- data.frame(
+  variable = character(),
+  df = numeric(),
+  X2 = numeric(),
+  p_value = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Assumes Purchase has levels c("0","1") or c(0, 1) and "1" is the positive class
+pos_lvl <- levels(df$Purchase)[2]
+
 for (v in cat_vars) {
-  # Compute purchase rate by category
-  tab <- tapply(df$Purchase, df[[v]], mean, na.rm = TRUE)
+  # Purchase rate by category (as a mean of TRUE/FALSE)
+  tab <- with(df, tapply(Purchase == pos_lvl, df[[v]], mean, na.rm = TRUE))
   
-  # Make barplot
+
+  
+  # Pull chi-square row if present
+  chi_row <- chi_results[chi_results$variable == v, ]
+  x2   <- if (nrow(chi_row)) round(chi_row$X2, 2) else NA_real_
+  pval <- if (nrow(chi_row)) chi_row$p_value else NA_real_
+  p_label <- if (is.na(pval)) "NA"
+  else if (pval < 0.001) "< 0.001"
+  else sprintf("= %.3f", pval)
+  
+  ymax <- max(tab, na.rm = TRUE)
+  if (!is.finite(ymax)) next
+  
   barplot(tab,
           main = paste("Purchase Rate by", v),
+          sub  = bquote(chi^2 == .(x2) ~ ", p" ~ .(p_label)),
           ylab = "Purchase Rate",
           xlab = v,
-          ylim = c(0, max(tab, na.rm = TRUE) * 1.1),
-          col = "skyblue")
+          ylim = c(0, ymax * 1.1),
+          col  = "skyblue")
   
-  # Add % labels above bars
   text(x = seq_along(tab),
        y = tab,
-       labels = paste0(round(100*tab, 1), "%"),
+       labels = paste0(round(100 * tab, 1), "%"),
        pos = 3, cex = 0.8)
 }
 
-for (v in cat_vars) {
-  tab <- table(df$Purchase, df[[v]])
-  tab
-  print(v)
-  print(chisq.test(tab))
-}
 
 
-
-
-results_cat <- data.frame(var = character(), r2 = numeric())
-
-for (var in cat_vars) {
-  form <- as.formula(paste("Purchase ~", var, "- 1"))
-  fit <- glm(form, data = df, family = binomial)
-  fit_null <- glm(Purchase ~ 1, data = df, family = binomial)
-  r2_val <- 1 - (as.numeric(logLik(fit)) / as.numeric(logLik(fit_null)))
-  results_cat <- rbind(results_cat, data.frame(var = var, r2 = r2_val))
-}
+results_cat <- map_dfr(cat_vars, one_var_auc) %>%
+  arrange(desc(auc))
 
 print(results_cat)
 
 
 
+
 results_all <- bind_rows(results_num, results_cat) %>%
-  arrange(desc(r2))
+  arrange(desc(auc))
 
 print(results_all)
 
@@ -147,6 +175,10 @@ print(results_all)
 #         the composite score).
 #   - Summarize which scores appear most promising to keep for modeling.
 #
+
+
+
+
 # 7) Synthesize findings
 #   - Capture top predictive variables, unexpected patterns, and any data quality
 #     concerns discovered during EDA.
