@@ -22,6 +22,7 @@ library(tidyverse)
 library(skimr)
 library(broom)
 library(yardstick)
+library(caret)
 
 
 df <- readr::read_csv("data/dataTravelPlus.csv")
@@ -158,8 +159,72 @@ print(results_all)
 #   - Provide explicit commentary on whether the data supports Joi's intuition
 #     that lifestyle variables may mostly add noise.
 
+lifestyle_vars <- c("StreamingHours", "PetOwnership", "CommuteDistance", "DiningOutFreq", "AppDownloads")
+demo_vars <- c("Age", "Income", "Region", "MaritalStatus", "HomeOwner", "HasKids")
+engagement_vars <- c("WebVisits", "OnlinePurchases", "EmailOpens", "EmailClicks")
+risk_vars <- c("ClaimsPastYear", "Incidents3Y", "PriorAddons", "LatePayments")
+spend_vars <- c("Spend_Travel", "Spend_Sports", "Spend_Electronics", "Spend_Fashion", "Spend_Health")
+score_vars <- c("Score_Engagement", "Score_Value", "Score_Risk", "Score_Upsell")
 
+var_groups <- list(
+  Demographics       = demo_vars,
+  EngagementBehavior = engagement_vars,
+  RiskHistory        = risk_vars,
+  SpendingPatterns   = spend_vars,
+  CompositeScores    = score_vars,
+  Lifestyle          = lifestyle_vars
+)
 
+auc_results <- data.frame(
+  group = character(),
+  mean_auc = numeric(),
+  stringsAsFactors = FALSE
+)
+
+ctrl <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary
+)
+df$Purchase <- factor(df$Purchase,
+                      levels = c(0, 1),
+                      labels = c("No", "Yes"))
+for (g in names(var_groups)) {
+  vars <- var_groups[[g]]
+    f <- as.formula(paste("Purchase ~", paste(vars, collapse = " + ")))
+    model <- train(
+    f,
+    data = df,
+    method = "glm",
+    family = binomial,
+    metric = "ROC",
+    trControl = ctrl
+  )
+    auc_results <- rbind(
+    auc_results,
+    data.frame(group = g, mean_auc = model$results$ROC)
+  )
+}
+auc_results <- auc_results %>% arrange(desc(mean_auc))
+print(auc_results)
+
+combined_vars <- c(lifestyle_vars, engagement_vars)
+
+f <- as.formula(paste("Purchase ~", paste(combined_vars, collapse = " + ")))
+
+combined_model <- train(
+  f,
+  data = df,
+  method = "glm",
+  family = binomial,
+  metric = "ROC",
+  trControl = ctrl
+)
+
+print(combined_model$results$ROC)
+
+#When the lifestyle variables are combined with the high-quality engagement variables, AUC decreases from a model with just engagement variables.
 
 # 6) Examine composite scores
 #   - For each score (Score_Engagement, Score_Value, Score_Risk, Score_Upsell):
@@ -173,8 +238,81 @@ print(results_all)
 #         the composite score).
 #   - Summarize which scores appear most promising to keep for modeling.
 #
+score_components <- list(
+  Score_Engagement = c("WebVisits", "EmailOpens", "EmailClicks", "AppDownloads"),
+  Score_Value      = c("Income", "TenureMonths", "PriorAddons", "PolicyType"),
+  Score_Risk       = c("ClaimsPastYear", "Incidents3Y", "LatePayments"),
+  Score_Upsell     = c("PriorAddons", "EmailOpens", "WebVisits", "Age", "Income")
+)
+
+r2_results <- data.frame(
+  Score = character(),
+  R2 = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Loop through each composite score
+for (s in names(score_components)) {
+  vars <- score_components[[s]]
+  f <- as.formula(paste(s, "~", paste(vars, collapse = " + ")))
+  fit <- lm(f, data = df)
+  r2 <- summary(fit)$r.squared
+  r2_results <- rbind(r2_results, data.frame(Score = s, R2 = round(r2, 3)))
+}
+
+print(r2_results)
 
 
+composite_auc_results <- data.frame(
+  Score = character(),
+  AUC_without = numeric(),
+  AUC_with = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Loop over each composite
+for (s in names(score_components)) {
+  vars <- score_components[[s]]
+  
+  # Model 1: components only
+  f1 <- as.formula(paste("Purchase ~", paste(vars, collapse = " + ")))
+  model1 <- train(
+    f1,
+    data = df,
+    method = "glm",
+    family = binomial,
+    metric = "ROC",
+    trControl = ctrl
+  )
+  auc1 <- model1$results$ROC
+  
+  # Model 2: components + composite
+  f2 <- as.formula(paste("Purchase ~", paste(c(vars, s), collapse = " + ")))
+  model2 <- train(
+    f2,
+    data = df,
+    method = "glm",
+    family = binomial,
+    metric = "ROC",
+    trControl = ctrl
+  )
+  auc2 <- model2$results$ROC
+  
+  composite_auc_results <- rbind(
+    composite_auc_results,
+    data.frame(
+      Score = s,
+      AUC_without = round(auc1, 3),
+      AUC_with = round(auc2, 3)
+    )
+  )
+}
+
+composite_auc_results <- composite_auc_results %>%
+  mutate(Delta = round(AUC_with - AUC_without, 3)) %>%
+  arrange(desc(Delta))
+
+print(composite_auc_results)
 
 
 # 7) Synthesize findings
